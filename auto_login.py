@@ -28,8 +28,8 @@ BROWSER_HEADERS = {
 # 配置项 - 请根据实际情况修改
 PHONE = "USER_PHONE"           # 手机号
 PASSWORD = "USER_ID"           # 用户ID
-API_LOGIN = "https://api.example.com/ac/auth/loginByPhoneAndUid"
-API_OAUTH = "https://api.example.com/ac/auth/oauthRedirect"
+API_LOGIN = "https://api.215123.cn/ac/auth/loginByPhoneAndUid"
+API_OAUTH = "https://api.215123.cn/ac/auth/oauthRedirect"
 GATEWAY = "http://10.10.16.101:8080/eportal/login_sso.jsp"
 CHECK_URL = "http://connect.rom.miui.com/generate_204"
 SERVICE_NAME = "chinaTelecom"
