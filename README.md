@@ -74,8 +74,9 @@ python3 -c "import requests; print('requests 库安装成功')"
 ```python
 PHONE = "13800138000"              # 替换为实际手机号
 PASSWORD = "USER_ID_HERE"          # 替换为实际用户 ID（通常是身份证后8位）
-API_LOGIN = "https://api.example.com/ac/auth/loginByPhoneAndUid"  # 替换为实际 API 地址
-API_OAUTH = "https://api.example.com/ac/auth/oauthRedirect"        # 替换为实际 OAuth 地址
+API_LOGIN = "https://api.215123.cn/ac/auth/loginByPhoneAndUid"
+API_OAUTH = "https://api.215123.cn/ac/auth/oauthRedirect"
+GATEWAY = "http://10.10.16.101:8080/eportal/login_sso.jsp"
 SERVICE_NAME = "chinaTelecom"      # 根据运营商选择（见下表）
 APARTMENT_ID = "1234567890"        # 替换为实际公寓 ID（获取方式见下文）
 ROOM_ID = "0987654321"             # 替换为实际房间 ID（获取方式见下文）
