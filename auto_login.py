@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import re
@@ -50,6 +51,7 @@ MAC_DHCP_WAIT_SECONDS = 10
 MAC_STATE_FILE = "/root/.autologin-mac-recovery.json"
 SCRIPT_LOCK_FILE = "/tmp/autologin.lock"
 NETWORK_PROBE_TIMEOUT = 3
+WATCH_INTERVAL_SECONDS = 10
 
 
 def log(msg):
@@ -436,5 +438,32 @@ def run_script():
         return main()
 
 
+def watch_network(interval=WATCH_INTERVAL_SECONDS):
+    """重复使用单轮入口；长恢复结束后至少休息一秒，避免忙循环。"""
+    log("后台自动登录检测已启动，检查间隔 {} 秒".format(interval))
+    try:
+        while True:
+            started = time.monotonic()
+            try:
+                result = run_script()
+                if result:
+                    log("本轮恢复未成功，耗时 {:.1f} 秒，等待下轮检查".format(time.monotonic() - started))
+            except Exception as error:
+                log("本轮检测异常: {}，等待下轮检查".format(type(error).__name__))
+            time.sleep(max(1, interval - (time.monotonic() - started)))
+    except KeyboardInterrupt:
+        return 0
+
+
+def cli():
+    parser = argparse.ArgumentParser(description="OpenWrt 校园网自动登录与网段漂移自愈")
+    parser.add_argument("--watch", action="store_true", help="持续检测网络")
+    parser.add_argument("--interval", type=int, default=WATCH_INTERVAL_SECONDS, help="检测间隔秒数，默认 10")
+    options = parser.parse_args()
+    if options.interval < 1:
+        parser.error("检测间隔必须大于零")
+    return watch_network(options.interval) if options.watch else run_script()
+
+
 if __name__ == "__main__":
-    sys.exit(run_script())
+    sys.exit(cli())
