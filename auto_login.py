@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import re
@@ -49,6 +50,8 @@ MAC_COOLDOWN_SECONDS = 30 * 60
 MAC_DHCP_WAIT_SECONDS = 10
 MAC_STATE_FILE = "/root/.autologin-mac-recovery.json"
 SCRIPT_LOCK_FILE = "/tmp/autologin.lock"
+NETWORK_PROBE_TIMEOUT = 3
+WATCH_INTERVAL_SECONDS = 10
 
 
 def log(msg):
@@ -59,7 +62,7 @@ def log(msg):
 def check_network():
     """检测网络连接状态"""
     try:
-        r = requests.get(CHECK_URL, timeout=5, allow_redirects=False)
+        r = requests.get(CHECK_URL, timeout=NETWORK_PROBE_TIMEOUT, allow_redirects=False)
         return r.status_code == 204
     except Exception:
         return False
@@ -262,14 +265,15 @@ def rotate_wan_mac():
 
 def prepare_wan():
     ip = wan_ip()
+    if not ip:
+        log("诊断：WAN 无 IPv4，先重拨获取地址，不按网段漂移处理")
+        if not reconnect_wan():
+            return False
+        ip = wan_ip()
     if ip and not expected_wan_ip(ip) and gateway_reachable() is False:
+        log("诊断：WAN IP {}，旧网段之外且认证连接不可达，符合网段漂移特征".format(ip))
         return rotate_wan_mac()
-    if not reconnect_wan():
-        return False
-    # 普通重拨也可能被 DHCP 分到错误网段，拿到地址后再判定一次。
-    ip = wan_ip()
-    if ip and not expected_wan_ip(ip) and gateway_reachable() is False:
-        return rotate_wan_mac()
+    log("诊断：不符合网段漂移特征，直接登录；可能是认证到期，未确认 48 小时原因")
     return True
 
 
@@ -282,17 +286,25 @@ def get_param(text, key):
 def main():
     if not restore_interrupted_rotation():
         return 1
-    # 1. 每轮先判定漂移；外网偶尔可用不能掩盖认证网关断联。
-    ip = wan_ip()
-    drifted = bool(ip and not expected_wan_ip(ip) and gateway_reachable() is False)
-    if not drifted and check_network():
+    # 1. 已联网时直接退出，认证地址探测失败不应打断正常连接。
+    if check_network():
         return 0
 
-    # 2. 重置网络接口
+    # 2. 先排除今天的漂移故障，有地址的普通断网直接认证。
     if not prepare_wan():
-        log("Failed to reconnect WAN.")
+        log("WAN 未就绪或 MAC 自愈未成功，本轮结束")
         return 1
 
+    try:
+        return login()
+    except requests.exceptions.RequestException as error:
+        # 不记录携带授权码的完整请求 URL。
+        log("登录请求失败: {}，保持当前 MAC，等待下轮检测".format(type(error).__name__))
+        return 1
+
+
+def login():
+    """保留原有认证流程，可在不重拨 WAN 的情况下重新登录。"""
     # 3. 创建会话并设置请求头
     session = requests.Session()
     session.headers.update(BROWSER_HEADERS)
@@ -300,7 +312,7 @@ def main():
     # 4. 捕获认证参数
     portal_content = None
     try:
-        r = session.get(CHECK_URL, allow_redirects=False, timeout=10)
+        r = session.get(CHECK_URL, allow_redirects=False, timeout=(3, 5))
         if "wlanuserip" in r.text:
             portal_content = r.text
         else:
@@ -334,7 +346,7 @@ def main():
         API_LOGIN,
         json={"phone": PHONE, "uid": PASSWORD, "captchaKey": ""},
         headers=BROWSER_HEADERS,
-        timeout=10,
+        timeout=(3, 10),
     )
     satoken = r.json().get("data", {}).get("token", "")
     if not satoken:
@@ -360,7 +372,7 @@ def main():
     oauth_headers["satoken"] = satoken
 
     # 8. 获取 OAuth 授权码
-    r2 = session.get(oauth_url, headers=oauth_headers, allow_redirects=False, timeout=15)
+    r2 = session.get(oauth_url, headers=oauth_headers, allow_redirects=False, timeout=(3, 15))
 
     api_jsessionid = None
     for c in session.cookies:
@@ -400,13 +412,15 @@ def main():
     if api_jsessionid:
         final_headers["Cookie"] = f"JSESSIONID={api_jsessionid}"
 
-    session.get(final_url, headers=final_headers, allow_redirects=True, timeout=20)
+    session.get(final_url, headers=final_headers, allow_redirects=True, timeout=(3, 20))
 
     # 10. 验证登录状态
-    time.sleep(3)
-    if check_network():
-        log("SUCCESS! Network is up.")
-        return 0
+    for attempt in range(4):
+        if attempt:
+            time.sleep(1)
+        if check_network():
+            log("SUCCESS! Network is up.")
+            return 0
 
     log("Verification failed.")
     return 1
@@ -424,5 +438,32 @@ def run_script():
         return main()
 
 
+def watch_network(interval=WATCH_INTERVAL_SECONDS):
+    """重复使用单轮入口；长恢复结束后至少休息一秒，避免忙循环。"""
+    log("后台自动登录检测已启动，检查间隔 {} 秒".format(interval))
+    try:
+        while True:
+            started = time.monotonic()
+            try:
+                result = run_script()
+                if result:
+                    log("本轮恢复未成功，耗时 {:.1f} 秒，等待下轮检查".format(time.monotonic() - started))
+            except Exception as error:
+                log("本轮检测异常: {}，等待下轮检查".format(type(error).__name__))
+            time.sleep(max(1, interval - (time.monotonic() - started)))
+    except KeyboardInterrupt:
+        return 0
+
+
+def cli():
+    parser = argparse.ArgumentParser(description="OpenWrt 校园网自动登录与网段漂移自愈")
+    parser.add_argument("--watch", action="store_true", help="持续检测网络")
+    parser.add_argument("--interval", type=int, default=WATCH_INTERVAL_SECONDS, help="检测间隔秒数，默认 10")
+    options = parser.parse_args()
+    if options.interval < 1:
+        parser.error("检测间隔必须大于零")
+    return watch_network(options.interval) if options.watch else run_script()
+
+
 if __name__ == "__main__":
-    sys.exit(run_script())
+    sys.exit(cli())

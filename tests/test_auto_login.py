@@ -23,6 +23,9 @@ class Router:
         self.changes = []
         self.authenticated = False
         self.reconnects = 0
+        self.network_checks = 0
+        self.recover_after_checks = None
+        self.sleeps = []
 
     def command(self, args, **kwargs):
         out, rc = "", 0
@@ -62,11 +65,16 @@ class Router:
 
     def get(self, url, **kwargs):
         if url == app.CHECK_URL:
+            self.network_checks += 1
+            if self.recover_after_checks and self.network_checks >= self.recover_after_checks:
+                self.authenticated = True
             location = "http://10.10.16.101:8080/eportal/index.jsp?wlanuserip={}&mac={}&wlanacname=ac".format(self.ip, self.mac)
             return SimpleNamespace(status_code=204 if self.authenticated else 302, text="", headers={"Location": location})
         if url.startswith(app.API_OAUTH):
             return SimpleNamespace(status_code=302, text="", headers={"Location": "http://gateway/?code=testcode1234567890123456"})
         if "code=" in url:
+            if not self.reachable:
+                raise app.requests.exceptions.ConnectTimeout("模拟认证连接超时")
             self.authenticated = True
         elif not self.reachable:
             raise app.requests.exceptions.ConnectTimeout("模拟认证网关连接超时")
@@ -78,7 +86,7 @@ class Router:
 
 
 class AutoLoginTests(unittest.TestCase):
-    def invoke(self, router, state=None):
+    def invoke(self, router, state=None, watch=False):
         with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
             state_path = str(Path(directory) / "recovery.json")
             if state is not None:
@@ -88,9 +96,19 @@ class AutoLoginTests(unittest.TestCase):
             stack.enter_context(patch.object(app.subprocess, "run", router.command))
             stack.enter_context(patch.object(app.requests, "get", router.get))
             stack.enter_context(patch.object(app.requests, "Session", router.session))
-            stack.enter_context(patch.object(app.time, "sleep"))
+            def sleep(seconds):
+                router.sleeps.append(seconds)
+                if watch and len(router.sleeps) == 2:
+                    raise KeyboardInterrupt
+
+            stack.enter_context(patch.object(app.time, "sleep", side_effect=sleep))
+            if watch:
+                fake_fcntl = SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=lambda *args: None)
+                stack.enter_context(patch.dict("sys.modules", {"fcntl": fake_fcntl}))
+                stack.enter_context(patch.object(app, "SCRIPT_LOCK_FILE", str(Path(directory) / "lock")))
+                stack.enter_context(patch.object(app.time, "monotonic", return_value=0))
             output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-            result = app.main()
+            result = app.watch_network(10) if watch else app.main()
             persisted = json.loads(Path(state_path).read_text()) if Path(state_path).exists() else None
             return result, output.getvalue(), persisted
 
@@ -101,6 +119,7 @@ class AutoLoginTests(unittest.TestCase):
         self.assertTrue(router.authenticated)
         self.assertEqual(router.mac, router.original)
         self.assertEqual(router.changes, [])
+        self.assertEqual(router.reconnects, 0)
         self.assertIn("SUCCESS! Network is up.", logs)
 
     def test_drift_rotates_then_completes_login(self):
@@ -115,15 +134,18 @@ class AutoLoginTests(unittest.TestCase):
         self.assertIn("MAC 轮换成功，网关可达", logs)
         self.assertIn("清理旧设备", logs)
 
-    def test_drift_is_detected_even_when_internet_probe_succeeds(self):
+    def test_online_network_skips_rotation_despite_unreachable_auth_gateway(self):
         router = Router("10.111.105.88", False, {
             "38:02:E3:08:70:A6": ("10.111.97.173", True),
         })
         router.authenticated = True
-        result, logs, _ = self.invoke(router)
+        result, logs, state = self.invoke(router)
         self.assertEqual(result, 0)
-        self.assertEqual(router.mac, "38:02:E3:08:70:A6")
-        self.assertIn("MAC 轮换成功，网关可达", logs)
+        self.assertEqual(router.mac, "38:02:E3:08:70:A5")
+        self.assertEqual(router.changes, [])
+        self.assertEqual(router.reconnects, 0)
+        self.assertIsNone(state)
+        self.assertNotIn("启动 MAC 轮换", logs)
 
     def test_all_candidates_fail_restores_original_mac_and_configuration(self):
         router = Router("10.111.105.88", False)
@@ -158,12 +180,49 @@ class AutoLoginTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(router.changes, [])
         self.assertTrue(router.authenticated)
+        self.assertEqual(router.reconnects, 0)
 
     def test_original_prefix_with_unreachable_gateway_does_not_rotate(self):
         router = Router("10.111.97.173", False)
-        result, _, state = self.invoke(router)
+        result, logs, state = self.invoke(router)
+        self.assertEqual(result, 1)
+        self.assertEqual(router.changes, [])
+        self.assertEqual(router.reconnects, 0)
+        self.assertIsNone(state)
+        self.assertIn("直接登录", logs)
+        self.assertIn("ConnectTimeout", logs)
+
+    def test_api_failure_never_rotates_mac(self):
+        router = Router()
+        with patch.object(router, "session", side_effect=app.requests.exceptions.ConnectionError()):
+            result, logs, state = self.invoke(router)
+        self.assertEqual(result, 1)
+        self.assertEqual(router.changes, [])
+        self.assertEqual(router.reconnects, 0)
+        self.assertIsNone(state)
+        self.assertIn("ConnectionError", logs)
+
+    def test_monitor_checks_every_ten_seconds_without_touching_online_wan(self):
+        router = Router("10.111.105.88", False)
+        router.authenticated = True
+        result, _, state = self.invoke(router, watch=True)
+        self.assertEqual(result, 0)
+        self.assertEqual(router.network_checks, 2)
+        self.assertEqual(router.sleeps, [10, 10])
+        self.assertEqual(router.changes, [])
+        self.assertEqual(router.reconnects, 0)
+        self.assertIsNone(state)
+
+    def test_monitor_continues_after_failed_login(self):
+        router = Router()
+        router.recover_after_checks = 2
+        with patch.object(router, "session", side_effect=app.requests.exceptions.ConnectionError()):
+            result, logs, state = self.invoke(router, watch=True)
+        self.assertEqual(result, 0)
+        self.assertEqual(router.network_checks, 2)
         self.assertEqual(router.changes, [])
         self.assertIsNone(state)
+        self.assertIn("本轮恢复未成功", logs)
 
     def test_interrupted_rotation_restores_before_cooldown(self):
         router = Router("10.111.105.88", False)
