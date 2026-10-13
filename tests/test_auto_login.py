@@ -115,15 +115,18 @@ class AutoLoginTests(unittest.TestCase):
         self.assertIn("MAC 轮换成功，网关可达", logs)
         self.assertIn("清理旧设备", logs)
 
-    def test_drift_is_detected_even_when_internet_probe_succeeds(self):
+    def test_online_network_skips_rotation_despite_unreachable_auth_gateway(self):
         router = Router("10.111.105.88", False, {
             "38:02:E3:08:70:A6": ("10.111.97.173", True),
         })
         router.authenticated = True
-        result, logs, _ = self.invoke(router)
+        result, logs, state = self.invoke(router)
         self.assertEqual(result, 0)
-        self.assertEqual(router.mac, "38:02:E3:08:70:A6")
-        self.assertIn("MAC 轮换成功，网关可达", logs)
+        self.assertEqual(router.mac, "38:02:E3:08:70:A5")
+        self.assertEqual(router.changes, [])
+        self.assertEqual(router.reconnects, 0)
+        self.assertIsNone(state)
+        self.assertNotIn("启动 MAC 轮换", logs)
 
     def test_all_candidates_fail_restores_original_mac_and_configuration(self):
         router = Router("10.111.105.88", False)

@@ -282,10 +282,8 @@ def get_param(text, key):
 def main():
     if not restore_interrupted_rotation():
         return 1
-    # 1. 每轮先判定漂移；外网偶尔可用不能掩盖认证网关断联。
-    ip = wan_ip()
-    drifted = bool(ip and not expected_wan_ip(ip) and gateway_reachable() is False)
-    if not drifted and check_network():
+    # 1. 已联网时直接退出，认证地址探测失败不应打断正常连接。
+    if check_network():
         return 0
 
     # 2. 重置网络接口
