@@ -183,7 +183,9 @@ def original_wan_mac():
 def restore_wan_mac(state):
     original = state["original"]
     if original["value"] is None:
-        run_command(["uci", "-q", "delete", original["key"]])
+        config = run_command(["uci", "-q", "show", "network"])
+        if any(line.startswith(original["key"] + "=") for line in config.splitlines()):
+            run_command(["uci", "-q", "delete", original["key"]])
     else:
         run_command(["uci", "set", original["key"] + "=" + original["value"]])
     run_command(["uci", "commit", "network"])
@@ -225,8 +227,9 @@ def rotate_wan_mac():
         if not candidates or any(not re.fullmatch(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", mac)
                                  or int(mac[:2], 16) & 1 for mac in candidates):
             raise ValueError("候选 MAC 必须是有效单播地址")
-        state = {"last_attempt": time.time(), "original": original, "pending": True}
-        save_mac_state(state)  # 写入成功后才允许改 MAC。
+        new_state = {"last_attempt": time.time(), "original": original, "pending": True}
+        save_mac_state(new_state)  # 写入成功后才允许改 MAC 或执行回滚。
+        state = new_state
         log("认证网关不可达，启动 MAC 轮换自愈...")
         for mac in candidates:
             log("尝试 MAC: " + mac)

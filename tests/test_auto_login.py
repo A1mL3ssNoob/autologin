@@ -39,6 +39,7 @@ class Router:
             self.config = args[2].split("=", 1)[1]
             self.changes.append(self.config)
         elif args[:3] == ["uci", "-q", "delete"]:
+            rc = 0 if self.config is not None else 1
             self.config = None
         elif args[:2] == ["uci", "commit"]:
             pass
@@ -124,6 +125,73 @@ class AutoLoginTests(unittest.TestCase):
         self.assertFalse(state["pending"])
         self.assertIn("所有候选 MAC 均失败", logs)
         self.assertIn("已恢复原始 MAC", logs)
+
+    def test_cooldown_skips_mac_changes_and_redial(self):
+        router = Router("10.111.105.88", False)
+        result, logs, _ = self.invoke(router, {"last_attempt": time.time(), "pending": False})
+        self.assertEqual(result, 1)
+        self.assertEqual(router.changes, [])
+        self.assertEqual(router.reconnects, 0)
+        self.assertIn("冷却期", logs)
+
+    def test_missing_ip_does_not_trigger_rotation(self):
+        router = Router("", False)
+        result, _, state = self.invoke(router)
+        self.assertEqual(result, 1)
+        self.assertEqual(router.changes, [])
+        self.assertEqual(router.reconnects, 1)
+        self.assertIsNone(state)
+
+    def test_different_prefix_with_reachable_gateway_logs_in_normally(self):
+        router = Router("10.111.105.88", True)
+        result, _, _ = self.invoke(router)
+        self.assertEqual(result, 0)
+        self.assertEqual(router.changes, [])
+        self.assertTrue(router.authenticated)
+
+    def test_original_prefix_with_unreachable_gateway_does_not_rotate(self):
+        router = Router("10.111.97.173", False)
+        result, _, state = self.invoke(router)
+        self.assertEqual(router.changes, [])
+        self.assertIsNone(state)
+
+    def test_interrupted_rotation_restores_before_cooldown(self):
+        router = Router("10.111.105.88", False)
+        router.mac = router.config = "38:02:E3:08:70:A6"
+        original = {"device": "wan", "mac": "38:02:E3:08:70:A5",
+                    "key": "network.@device[1].macaddr", "value": "38:02:E3:08:70:A5"}
+        result, logs, state = self.invoke(router, {"last_attempt": time.time(), "pending": True, "original": original})
+        self.assertEqual(result, 1)
+        self.assertEqual(router.mac, "38:02:E3:08:70:A5")
+        self.assertFalse(state["pending"])
+        self.assertIn("上次中断", logs)
+
+    def test_failure_restores_mac_when_original_config_has_no_override(self):
+        router = Router("10.111.105.88", False)
+        router.config = None
+        result, _, _ = self.invoke(router)
+        self.assertEqual(result, 1)
+        self.assertEqual(router.mac, "38:02:E3:08:70:A5")
+        self.assertIsNone(router.config)
+
+    def test_state_file_cannot_be_written_never_changes_wan(self):
+        router = Router("10.111.105.88", False)
+        with patch.object(app.os, "replace", side_effect=OSError("状态文件不能写入")):
+            result, _, _ = self.invoke(router)
+        self.assertEqual(result, 1)
+        self.assertEqual(router.changes, [])
+        self.assertEqual(router.reconnects, 0)
+
+    def test_interrupted_restore_handles_already_deleted_mac_option(self):
+        router = Router("10.111.105.88", False)
+        router.config = None
+        router.mac = "38:02:E3:08:70:A6"
+        original = {"device": "wan", "mac": "38:02:E3:08:70:A5",
+                    "key": "network.@device[1].macaddr", "value": None}
+        result, logs, state = self.invoke(router, {"last_attempt": time.time(), "pending": True, "original": original})
+        self.assertEqual(router.mac, "38:02:E3:08:70:A5")
+        self.assertIsNone(router.config)
+        self.assertFalse(state["pending"])
 
 
 if __name__ == "__main__":
