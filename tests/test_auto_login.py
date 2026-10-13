@@ -67,6 +67,8 @@ class Router:
         if url.startswith(app.API_OAUTH):
             return SimpleNamespace(status_code=302, text="", headers={"Location": "http://gateway/?code=testcode1234567890123456"})
         if "code=" in url:
+            if not self.reachable:
+                raise app.requests.exceptions.ConnectTimeout("模拟认证连接超时")
             self.authenticated = True
         elif not self.reachable:
             raise app.requests.exceptions.ConnectTimeout("模拟认证网关连接超时")
@@ -101,6 +103,7 @@ class AutoLoginTests(unittest.TestCase):
         self.assertTrue(router.authenticated)
         self.assertEqual(router.mac, router.original)
         self.assertEqual(router.changes, [])
+        self.assertEqual(router.reconnects, 0)
         self.assertIn("SUCCESS! Network is up.", logs)
 
     def test_drift_rotates_then_completes_login(self):
@@ -161,12 +164,27 @@ class AutoLoginTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(router.changes, [])
         self.assertTrue(router.authenticated)
+        self.assertEqual(router.reconnects, 0)
 
     def test_original_prefix_with_unreachable_gateway_does_not_rotate(self):
         router = Router("10.111.97.173", False)
-        result, _, state = self.invoke(router)
+        result, logs, state = self.invoke(router)
+        self.assertEqual(result, 1)
         self.assertEqual(router.changes, [])
+        self.assertEqual(router.reconnects, 0)
         self.assertIsNone(state)
+        self.assertIn("直接登录", logs)
+        self.assertIn("ConnectTimeout", logs)
+
+    def test_api_failure_never_rotates_mac(self):
+        router = Router()
+        with patch.object(router, "session", side_effect=app.requests.exceptions.ConnectionError()):
+            result, logs, state = self.invoke(router)
+        self.assertEqual(result, 1)
+        self.assertEqual(router.changes, [])
+        self.assertEqual(router.reconnects, 0)
+        self.assertIsNone(state)
+        self.assertIn("ConnectionError", logs)
 
     def test_interrupted_rotation_restores_before_cooldown(self):
         router = Router("10.111.105.88", False)
