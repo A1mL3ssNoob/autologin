@@ -1,3 +1,6 @@
+import argparse
+import json
+import os
 import re
 import subprocess
 import sys
@@ -36,6 +39,20 @@ SERVICE_NAME = "chinaTelecom"
 APARTMENT_ID = "YOUR_APARTMENT_ID"
 ROOM_ID = "YOUR_ROOM_ID"
 
+# 网段漂移自愈：使用固定候选，避免每轮生成新设备身份。
+WAN_INTERFACE = "wan"
+EXPECTED_WAN_PREFIX = "10.111.97"
+MAC_CANDIDATES = (
+    "38:02:E3:08:70:A6", "38:02:E3:08:70:A7",
+    "38:02:E3:08:70:A8", "38:02:E3:08:70:A9",
+)
+MAC_COOLDOWN_SECONDS = 30 * 60
+MAC_DHCP_WAIT_SECONDS = 10
+MAC_STATE_FILE = "/root/.autologin-mac-recovery.json"
+SCRIPT_LOCK_FILE = "/tmp/autologin.lock"
+NETWORK_PROBE_TIMEOUT = 3
+WATCH_INTERVAL_SECONDS = 10
+
 
 def log(msg):
     """日志输出"""
@@ -45,34 +62,219 @@ def log(msg):
 def check_network():
     """检测网络连接状态"""
     try:
-        r = requests.get(CHECK_URL, timeout=5, allow_redirects=False)
+        r = requests.get(CHECK_URL, timeout=NETWORK_PROBE_TIMEOUT, allow_redirects=False)
         return r.status_code == 204
     except Exception:
         return False
 
 
-def reconnect_wan():
+def wan_status():
+    """空地址数组或命令失败都不能视为已获取 IPv4。"""
+    try:
+        result = subprocess.run(["ifstatus", WAN_INTERFACE], capture_output=True,
+                                text=True, timeout=5)
+        return json.loads(result.stdout) if result.returncode == 0 else {}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {}
+
+
+def wan_ip():
+    for address in wan_status().get("ipv4-address", []):
+        ip = address.get("address", "")
+        if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", ip):
+            return ip
+    return ""
+
+
+def expected_wan_ip(ip):
+    return ip.startswith(EXPECTED_WAN_PREFIX.rstrip(".") + ".")
+
+
+def gateway_reachable():
+    """HTTP 响应证明可达；连接超时证明不可达，其他错误用 ping 判定。"""
+    gateway = urllib.parse.urlsplit(GATEWAY)
+    probe_url = urllib.parse.urlunsplit((gateway.scheme, gateway.netloc,
+                                        "/eportal/index.jsp", "", ""))
+    try:
+        requests.get(probe_url, timeout=(3, 3), allow_redirects=False)
+        return True
+    except requests.exceptions.ConnectTimeout:
+        return False
+    except requests.exceptions.ReadTimeout:
+        # TCP 已连接，只是门户响应慢，不是连接不可达。
+        return True
+    except requests.exceptions.RequestException:
+        try:
+            result = subprocess.run(["ping", "-c", "2", "-W", "2", gateway.hostname],
+                                    capture_output=True, text=True, timeout=6)
+            if result.returncode in (0, 1):
+                return result.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return None
+
+
+def run_command(args):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=10)
+    if result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, args, result.stdout, result.stderr)
+    return result.stdout
+
+
+def reconnect_wan(minimum_wait=0, restore_mac=None, device=None):
     """重置 WAN 接口并等待新 IP"""
     log("Reconnecting WAN...")
-    subprocess.run(["ifdown", "wan"], timeout=10)
+    run_command(["ifdown", WAN_INTERFACE])
     time.sleep(5)
-    subprocess.run(["ifup", "wan"], timeout=10)
-    
+    if restore_mac:
+        run_command(["ip", "link", "set", "dev", device, "address", restore_mac])
+    run_command(["ifup", WAN_INTERFACE])
+    time.sleep(minimum_wait)
     for _ in range(15):
-        try:
-            out = subprocess.run(
-                ["ifstatus", "wan"], 
-                capture_output=True, 
-                text=True, 
-                timeout=5
-            ).stdout
-            if '"ipv4-address"' in out:
-                log("WAN got new IP.")
-                return True
-        except Exception:
-            pass
+        if wan_ip():
+            log("WAN got new IP.")
+            return True
         time.sleep(2)
     return False
+
+
+def load_mac_state():
+    try:
+        with open(MAC_STATE_FILE, encoding="utf-8") as stream:
+            state = json.load(stream)
+        if not isinstance(state, dict):
+            raise ValueError("MAC 状态文件格式错误")
+        return state
+    except FileNotFoundError:
+        return {}
+
+
+def save_mac_state(state):
+    temporary = MAC_STATE_FILE + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        os.chmod(temporary, 0o600)
+        json.dump(state, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, MAC_STATE_FILE)
+
+
+def original_wan_mac():
+    """找到 netifd 管理的设备 MAC 选项，并记录实际 MAC 和旧选项。"""
+    status = wan_status()
+    device = status.get("device") or status.get("l3_device")
+    if not device or not re.fullmatch(r"[\w.:-]+", device):
+        raise ValueError("无法确定 WAN 设备")
+    output = run_command(["ip", "link", "show", "dev", device])
+    match = re.search(r"link/ether\s+([0-9a-fA-F:]{17})", output)
+    if not match:
+        raise ValueError("无法读取原始 WAN MAC")
+    config = {}
+    for line in run_command(["uci", "-q", "show", "network"]).splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            config[key] = value.strip("'")
+    key = "network.{}.macaddr".format(WAN_INTERFACE)
+    for section, kind in config.items():
+        if kind == "device" and config.get(section + ".name") == device:
+            key = section + ".macaddr"
+            break
+    return {"device": device, "mac": match.group(1).upper(),
+            "key": key, "value": config.get(key)}
+
+
+def restore_wan_mac(state):
+    original = state["original"]
+    if original["value"] is None:
+        config = run_command(["uci", "-q", "show", "network"])
+        if any(line.startswith(original["key"] + "=") for line in config.splitlines()):
+            run_command(["uci", "-q", "delete", original["key"]])
+    else:
+        run_command(["uci", "set", original["key"] + "=" + original["value"]])
+    run_command(["uci", "commit", "network"])
+    run_command(["ubus", "call", "network", "reload"])
+    has_ip = reconnect_wan(MAC_DHCP_WAIT_SECONDS, original["mac"], original["device"])
+    # 恢复身份不依赖 DHCP 是否正常；没有地址仍须结束轮换并保留冷却。
+    actual = run_command(["ip", "link", "show", "dev", original["device"]])
+    if not re.search(r"link/ether\s+" + re.escape(original["mac"]), actual, re.I):
+        raise ValueError("原 MAC 回读校验失败")
+    state["pending"] = False
+    save_mac_state(state)
+    log("已恢复原始 MAC: {}{}".format(original["mac"], "" if has_ip else "，WAN 暂无 IP"))
+
+
+def restore_interrupted_rotation():
+    try:
+        state = load_mac_state()
+        if state.get("pending"):
+            log("发现上次中断的 MAC 轮换，先恢复原始 MAC")
+            restore_wan_mac(state)
+        return True
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        log("MAC 状态读取或恢复失败，停止本轮: {}".format(error))
+        return False
+
+
+def rotate_wan_mac():
+    state = None
+    success = False
+    try:
+        previous = load_mac_state()
+        remaining = MAC_COOLDOWN_SECONDS - (time.time() - previous.get("last_attempt", 0))
+        if remaining > 0:
+            log("MAC 轮换处于冷却期，剩余 {} 秒，等待下次 cron".format(int(remaining)))
+            return False
+        original = original_wan_mac()
+        candidates = list(dict.fromkeys(mac.upper() for mac in MAC_CANDIDATES))
+        candidates = [mac for mac in candidates if mac != original["mac"]]
+        if not candidates or any(not re.fullmatch(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", mac)
+                                 or int(mac[:2], 16) & 1 for mac in candidates):
+            raise ValueError("候选 MAC 必须是有效单播地址")
+        new_state = {"last_attempt": time.time(), "original": original, "pending": True}
+        save_mac_state(new_state)  # 写入成功后才允许改 MAC 或执行回滚。
+        state = new_state
+        log("认证网关不可达，启动 MAC 轮换自愈...")
+        for mac in candidates:
+            log("尝试 MAC: " + mac)
+            run_command(["uci", "set", original["key"] + "=" + mac])
+            run_command(["ubus", "call", "network", "reload"])
+            if not reconnect_wan(MAC_DHCP_WAIT_SECONDS):
+                log("该 MAC 未获取 WAN IP")
+                continue
+            ip = wan_ip()
+            log("新 IP: " + ip)
+            if expected_wan_ip(ip) and gateway_reachable() is True:
+                run_command(["uci", "commit", "network"])
+                state["pending"] = False
+                save_mac_state(state)
+                success = True
+                log("MAC 轮换成功，网关可达")
+                log("新 MAC 会占用校园网设备名额，请到校园网后台清理旧设备")
+                return True
+        log("所有候选 MAC 均失败，恢复原始 MAC，等待下次 cron")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        log("MAC 轮换失败: {}".format(error))
+    finally:
+        if state is not None and not success:
+            try:
+                restore_wan_mac(state)
+            except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+                log("原始 MAC 恢复失败，保留回滚记录，下次优先恢复: {}".format(error))
+    return False
+
+
+def prepare_wan():
+    ip = wan_ip()
+    if not ip:
+        log("诊断：WAN 无 IPv4，先重拨获取地址，不按网段漂移处理")
+        if not reconnect_wan():
+            return False
+        ip = wan_ip()
+    if ip and not expected_wan_ip(ip) and gateway_reachable() is False:
+        log("诊断：WAN IP {}，旧网段之外且认证连接不可达，符合网段漂移特征".format(ip))
+        return rotate_wan_mac()
+    log("诊断：不符合网段漂移特征，直接登录；可能是认证到期，未确认 48 小时原因")
+    return True
 
 
 def get_param(text, key):
@@ -82,15 +284,27 @@ def get_param(text, key):
 
 
 def main():
-    # 1. 检测网络状态
+    if not restore_interrupted_rotation():
+        return 1
+    # 1. 已联网时直接退出，认证地址探测失败不应打断正常连接。
     if check_network():
         return 0
 
-    # 2. 重置网络接口
-    if not reconnect_wan():
-        log("Failed to reconnect WAN.")
+    # 2. 先排除今天的漂移故障，有地址的普通断网直接认证。
+    if not prepare_wan():
+        log("WAN 未就绪或 MAC 自愈未成功，本轮结束")
         return 1
 
+    try:
+        return login()
+    except requests.exceptions.RequestException as error:
+        # 不记录携带授权码的完整请求 URL。
+        log("登录请求失败: {}，保持当前 MAC，等待下轮检测".format(type(error).__name__))
+        return 1
+
+
+def login():
+    """保留原有认证流程，可在不重拨 WAN 的情况下重新登录。"""
     # 3. 创建会话并设置请求头
     session = requests.Session()
     session.headers.update(BROWSER_HEADERS)
@@ -98,7 +312,7 @@ def main():
     # 4. 捕获认证参数
     portal_content = None
     try:
-        r = session.get(CHECK_URL, allow_redirects=False, timeout=10)
+        r = session.get(CHECK_URL, allow_redirects=False, timeout=(3, 5))
         if "wlanuserip" in r.text:
             portal_content = r.text
         else:
@@ -132,7 +346,7 @@ def main():
         API_LOGIN,
         json={"phone": PHONE, "uid": PASSWORD, "captchaKey": ""},
         headers=BROWSER_HEADERS,
-        timeout=10,
+        timeout=(3, 10),
     )
     satoken = r.json().get("data", {}).get("token", "")
     if not satoken:
@@ -158,7 +372,7 @@ def main():
     oauth_headers["satoken"] = satoken
 
     # 8. 获取 OAuth 授权码
-    r2 = session.get(oauth_url, headers=oauth_headers, allow_redirects=False, timeout=15)
+    r2 = session.get(oauth_url, headers=oauth_headers, allow_redirects=False, timeout=(3, 15))
 
     api_jsessionid = None
     for c in session.cookies:
@@ -198,17 +412,58 @@ def main():
     if api_jsessionid:
         final_headers["Cookie"] = f"JSESSIONID={api_jsessionid}"
 
-    session.get(final_url, headers=final_headers, allow_redirects=True, timeout=20)
+    session.get(final_url, headers=final_headers, allow_redirects=True, timeout=(3, 20))
 
     # 10. 验证登录状态
-    time.sleep(3)
-    if check_network():
-        log("SUCCESS! Network is up.")
-        return 0
+    for attempt in range(4):
+        if attempt:
+            time.sleep(1)
+        if check_network():
+            log("SUCCESS! Network is up.")
+            return 0
 
     log("Verification failed.")
     return 1
 
 
+def run_script():
+    """OpenWrt 上互斥整个运行过程，避免 cron 同时重拨或轮换。"""
+    import fcntl
+    with open(SCRIPT_LOCK_FILE, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log("已有自动登录任务运行，跳过本轮")
+            return 0
+        return main()
+
+
+def watch_network(interval=WATCH_INTERVAL_SECONDS):
+    """重复使用单轮入口；长恢复结束后至少休息一秒，避免忙循环。"""
+    log("后台自动登录检测已启动，检查间隔 {} 秒".format(interval))
+    try:
+        while True:
+            started = time.monotonic()
+            try:
+                result = run_script()
+                if result:
+                    log("本轮恢复未成功，耗时 {:.1f} 秒，等待下轮检查".format(time.monotonic() - started))
+            except Exception as error:
+                log("本轮检测异常: {}，等待下轮检查".format(type(error).__name__))
+            time.sleep(max(1, interval - (time.monotonic() - started)))
+    except KeyboardInterrupt:
+        return 0
+
+
+def cli():
+    parser = argparse.ArgumentParser(description="OpenWrt 校园网自动登录与网段漂移自愈")
+    parser.add_argument("--watch", action="store_true", help="持续检测网络")
+    parser.add_argument("--interval", type=int, default=WATCH_INTERVAL_SECONDS, help="检测间隔秒数，默认 10")
+    options = parser.parse_args()
+    if options.interval < 1:
+        parser.error("检测间隔必须大于零")
+    return watch_network(options.interval) if options.watch else run_script()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli())
